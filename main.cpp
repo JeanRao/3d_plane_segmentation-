@@ -4,11 +4,13 @@
 #include <pcl/visualization/pcl_visualizer.h>
 #include <pcl/visualization/cloud_viewer.h>
 #include <pcl/console/parse.h>
+#include <pcl/segmentation/extract_clusters.h>
 #include <eigen3/Eigen/Dense>
 #include <pcl/ModelCoefficients.h>
 #include <pcl/point_types.h>
 #include <pcl/sample_consensus/method_types.h>
 #include <pcl/segmentation/sac_segmentation.h>
+#include <pcl/features/normal_3d.h>
 #include <pcl/filters/extract_indices.h>
 #include <pcl/filters/voxel_grid.h>
 #include <vector>
@@ -22,7 +24,8 @@
 #include <boost/variant/variant.hpp>
 #include <boost/optional/optional.hpp>
 #include <CGAL/squared_distance_3_0.h>
-
+#include <fstream>
+#include <yaml-cpp/yaml.h>
 
 
 // Define kernel for CGAL
@@ -47,6 +50,38 @@ pcl::PointCloud<pcl::PointXYZ>::Ptr downsamplePointCloud(const pcl::PointCloud<p
 pcl::PointCloud<pcl::PointXYZ>::Ptr extractPointsInBox(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
                                                        Eigen::Vector4f min_pt,
                                                        Eigen::Vector4f max_pt);
+// calculate normal 
+pcl::PointCloud<pcl::PointNormal>::Ptr computeNormals(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud) {
+    // 创建法线估计器对象
+    pcl::NormalEstimation<pcl::PointXYZ, pcl::PointNormal> ne;
+    ne.setInputCloud(cloud);
+
+    // 创建一个 KdTree 对象（用于法线估计）
+    pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>);
+    ne.setSearchMethod(tree);
+
+    // 设置计算法线的半径
+    ne.setRadiusSearch(0.05);
+
+    // 计算法线
+    pcl::PointCloud<pcl::PointNormal>::Ptr cloud_with_normals(new pcl::PointCloud<pcl::PointNormal>);
+    ne.compute(*cloud_with_normals);
+
+    // 移除没有法线的点云
+    pcl::PointIndices::Ptr indices(new pcl::PointIndices);
+    for (size_t i = 0; i < cloud_with_normals->size(); ++i) {
+        if (!pcl::isFinite<pcl::PointNormal>((*cloud_with_normals)[i])) {
+            indices->indices.push_back(i);
+        }
+    }
+    pcl::ExtractIndices<pcl::PointNormal> extract;
+    extract.setInputCloud(cloud_with_normals);
+    extract.setIndices(indices);
+    extract.setNegative(true);
+    extract.filter(*cloud_with_normals);
+
+    return cloud_with_normals;
+}
 
 // 分割函数声明
 void segment_once(const pcl::PointCloud<pcl::PointXYZ>::Ptr cloud,
@@ -61,7 +96,6 @@ void show_multiple_point_clouds(const std::vector<PointCloudXYZPtr>& cloud_list)
 
 
 // 定义访问者类
-
 
 
 // Sviz_Plane
@@ -153,18 +187,50 @@ bool compare_function(const Eigen::Vector3d &v1, const Eigen:: Vector3d &v2, int
     }
 }
 
+
+std::vector<PointCloudXYZ> EuclideanCluster(PointCloudXYZPtr &cloud);
+std::vector<PointCloudXYZ> EuclideanCluster(PointCloudXYZPtr &cloud){
+    // 创建点云聚类对象
+    pcl::EuclideanClusterExtraction<pcl::PointXYZ> ec;
+    ec.setClusterTolerance(0.02); // 设置聚类的容差
+    ec.setMinClusterSize(100); // 设置聚类的最小大小
+    ec.setMaxClusterSize(25000); // 设置聚类的最大大小
+
+    ec.setInputCloud(cloud);
+
+    // 执行聚类
+    std::vector<pcl::PointIndices> cluster_indices;
+    ec.extract(cluster_indices);
+    //
+    std::vector<PointCloudXYZ> clusters ;
+    clusters.push_back(*cloud);
+    return clusters;
+    }
+
 std::vector<Eigen::Vector3d> GetFarthestPoints (std::vector<Eigen::Vector3d> &pointlist);
 std::vector<Eigen::Vector3d> GetFarthestPoints (std::vector<Eigen::Vector3d>& pointlist){
     std::vector<Eigen::Vector3d> farthest;
+    double distance_along_axis;
+    double max_distance;
+    max_distance=0;
     for (size_t i=0; i<3; ++i){
-
+        std::vector<Eigen::Vector3d> farthest_along_axis;
         bool reverse ;
         reverse = false;
         std:: sort(pointlist.begin(),pointlist.end(), [& i, &reverse](const Eigen::Vector3d &v1, const Eigen:: Vector3d &v2){
             return compare_function(v1,v2,i,reverse);
         });
-    farthest.push_back(pointlist.back());
-    }
+        farthest_along_axis.push_back(pointlist.front());
+        farthest_along_axis.push_back(pointlist.back());
+        distance_along_axis = (farthest_along_axis[0]-farthest_along_axis[1]).norm();
+        if (max_distance< distance_along_axis){
+            max_distance= distance_along_axis;
+            size_t start;
+            start = farthest_along_axis.size()-2;
+            std::vector<Eigen::Vector3d> farthest_temp(farthest_along_axis.begin()+start,farthest_along_axis.end());
+            farthest = farthest_temp;
+            }
+        }
     return farthest;
 }
 
@@ -182,8 +248,8 @@ void DistPtsToLine(const PointCloudXYZPtr cloud, Line_3 *line, std::vector<doubl
         Vector_3 b;
         b= line->direction().vector() ;
         Eigen::Vector3d c(b[0], b[1],b[2]);
-        float c_norm = c.norm();
-        float projection = a.dot(c)/c_norm;
+        double c_norm = c.norm();
+        double projection = a.dot(c)/c_norm;
         double distance_fin = sqrt(distance-projection*projection);
         distances.push_back(distance_fin);
     }
@@ -204,6 +270,161 @@ std::vector<Eigen::Vector3d> projectPointsToLine(const std::vector<Eigen::Vector
 
     return projected_points;
 }
+
+// dbscan
+class DBSCAN {
+public:
+    DBSCAN(double eps, int minPts) : eps_(eps), minPts_(minPts) {}
+
+    void setInputCloud(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud) {
+        cloud_ = cloud;
+    }
+
+    void extract(std::vector<pcl::PointIndices>& cluster_indices) {
+        std::vector<bool> visited(cloud_->size(), false);
+        std::vector<int> cluster(cloud_->size(), -1);
+        int cluster_idx = 0;
+
+        for (size_t i = 0; i < cloud_->size(); ++i) {
+            if (!visited[i]) {
+                visited[i] = true;
+                std::vector<int> neighbors;
+                regionQuery(i, neighbors);
+                if (neighbors.size() < minPts_) {
+                    cluster[i] = -1; // 噪声点
+                } else {
+                    expandCluster(i, neighbors, cluster, visited, cluster_idx);
+                    cluster_idx++;
+                }
+            }
+        }
+
+        cluster_indices.clear();
+        cluster_indices.resize(cluster_idx);
+        for (size_t i = 0; i < cloud_->size(); ++i) {
+            if (cluster[i] != -1) {
+                cluster_indices[cluster[i]].indices.push_back(i);
+            }
+        }
+    }
+
+private:
+    double eps_;
+    int minPts_;
+    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_;
+
+    void regionQuery(int idx, std::vector<int>& neighbors) {
+        neighbors.clear();
+        for (size_t i = 0; i < cloud_->size(); ++i) {
+            if ((cloud_->points[i].getVector3fMap() - cloud_->points[idx].getVector3fMap()).norm() <= eps_) {
+                neighbors.push_back(i);
+            }
+        }
+    }
+
+    void expandCluster(int idx, const std::vector<int>& neighbors, std::vector<int>& cluster,
+                       std::vector<bool>& visited, int cluster_idx) {
+        cluster[idx] = cluster_idx;
+        for (size_t i = 0; i < neighbors.size(); ++i) {
+            int neighbor_idx = neighbors[i];
+            if (!visited[neighbor_idx]) {
+                visited[neighbor_idx] = true;
+                std::vector<int> neighbor_neighbors;
+                regionQuery(neighbor_idx, neighbor_neighbors);
+                if (neighbor_neighbors.size() >= minPts_) {
+                    expandCluster(neighbor_idx, neighbor_neighbors, cluster, visited, cluster_idx);
+                }
+            }
+            if (cluster[neighbor_idx] == -1) {
+                cluster[neighbor_idx] = cluster_idx;
+            }
+        }
+    }
+};
+std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr> findLargestCluster(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud) {
+//    // 创建 DBSCAN 聚类对象
+//    double eps = 0.1;
+//    int minPts = 50;
+//    DBSCAN dbscan(eps, minPts);
+//    dbscan.setInputCloud(cloud);
+//
+//    // 执行聚类
+//    std::vector<pcl::PointIndices> cluster_indices;
+//    dbscan.extract(cluster_indices);
+//
+//    // 找到最大的聚类
+//    size_t max_cluster_size = 0;
+//    size_t max_cluster_index = 0;
+//    for (size_t i = 0; i < cluster_indices.size(); ++i) {
+//        if (cluster_indices[i].indices.size() > max_cluster_size) {
+//            max_cluster_size = cluster_indices[i].indices.size();
+//            max_cluster_index = i;
+//        }
+//    }
+//
+//    // 将最大的子点云放入 final_inlier 中，剩下的放入 remains 中
+//    pcl::PointCloud<pcl::PointXYZ>::Ptr final_inlier(new pcl::PointCloud<pcl::PointXYZ>);
+//    pcl::PointCloud<pcl::PointXYZ>::Ptr remains(new pcl::PointCloud<pcl::PointXYZ>);
+//    if (max_cluster_index != -1) {
+//        pcl::copyPointCloud(*cloud, cluster_indices[max_cluster_index].indices, *final_inlier);
+//        // 从 new_inlier_cloud 中移除最大的子点云对应的点
+//        pcl::ExtractIndices<pcl::PointXYZ> extract;
+//        extract.setInputCloud(cloud);
+//        extract.setIndices(boost::make_shared<const pcl::PointIndices>(cluster_indices[max_cluster_index]));
+//        extract.setNegative(true);
+//        extract.filter(*remains);
+//    } else {
+//        // 如果未找到聚类，则将所有点放入 remains 中
+//        remains = cloud;
+//    }
+//    return {final_inlier,remains};
+
+// EUCLIDIAN
+    // 创建点云聚类对象
+    pcl::EuclideanClusterExtraction<pcl::PointXYZ> ec;
+    ec.setClusterTolerance(0.02); // 设置聚类的容差
+    ec.setMinClusterSize(100); // 设置聚类的最小大小
+    ec.setMaxClusterSize(25000); // 设置聚类的最大大小
+
+    ec.setInputCloud(cloud);
+
+    // 执行聚类
+    std::vector<pcl::PointIndices> cluster_indices;
+    ec.extract(cluster_indices);
+
+    // 找到聚类中点数最多的类的索引
+    int max_cluster_index = 0;
+    int max_cluster_size = 0;
+    for (size_t i = 0; i < cluster_indices.size(); ++i) {
+        if (cluster_indices[i].indices.size() > max_cluster_size) {
+            max_cluster_size = cluster_indices[i].indices.size();
+            max_cluster_index = i;
+        }
+    }
+    // 创建最终的聚类点云和剩余点云
+    pcl::PointCloud<pcl::PointXYZ>::Ptr final_cluster(new pcl::PointCloud<pcl::PointXYZ>);
+    pcl::PointCloud<pcl::PointXYZ>::Ptr remains(new pcl::PointCloud<pcl::PointXYZ>);
+
+    // 将最大的聚类放入 final_cluster，剩下的放入 remains
+    if (max_cluster_index != -1)
+    {
+        for (size_t i = 0; i < cluster_indices.size(); ++i) {
+        if (i == max_cluster_index) {
+            pcl::copyPointCloud(*cloud, cluster_indices[i], *final_cluster);
+        } else {
+            pcl::PointCloud<pcl::PointXYZ>::Ptr cluster_cloud(new pcl::PointCloud<pcl::PointXYZ>);
+            pcl::copyPointCloud(*cloud, cluster_indices[i], *cluster_cloud);
+            *remains += *cluster_cloud;
+        }
+        }
+    }
+    else {
+        // 如果未找到聚类，则将所有点放入 remains 中
+        remains = cloud;
+    }
+    return {final_cluster,remains};
+}
+
 bool CheckIfTwoPlaneConnect(const std::vector<Sviz_Plane>& two_plane,
                                 float gap, std::vector<Eigen::Vector3d> &weld_line);
 
@@ -225,7 +446,7 @@ bool CheckIfTwoPlaneConnect(const std::vector<Sviz_Plane>& two_plane,
             if (auto line_ptr = boost::get<CGAL::Line_3<CGAL::Epick>>(&(*connect_line)))
             {
                     Direction_3 direction = line_ptr->direction();
-                    std::cout << 'inetrsect line direction'<< direction <<std::endl;
+//                    std::cout << 'inetrsect line direction'<< direction <<std::endl;
                     std::vector<PointCloudXYZPtr> point_clouds;
                     point_clouds.push_back(two_plane[0].plane_pcd_);
                     point_clouds.push_back(two_plane[1].plane_pcd_);
@@ -277,9 +498,9 @@ bool CheckIfTwoPlaneConnect(const std::vector<Sviz_Plane>& two_plane,
                     farthest2 = GetFarthestPoints(projected_close_points2);
                     // use the point pair with shortest length
                     double length1 ;
-                    length1 = (farthest1[0]-farthest1[-1]).norm();
+                    length1 = (farthest1[0]-farthest1[1]).norm();
                     double length2 ;
-                    length2 = (farthest2[0]-farthest2[-1]).norm();
+                    length2 = (farthest2[0]-farthest2[1]).norm();
                     if (length1>length2){
                         weld_line =  farthest2;
                     }else{
@@ -288,7 +509,7 @@ bool CheckIfTwoPlaneConnect(const std::vector<Sviz_Plane>& two_plane,
 //                    show_multiple_point_clouds(point_clouds);
                     return true;
             } else{
-                std::cout << 'two_plane is parallel' <<std::endl;
+//                std::cout << 'two_plane is parallel' <<std::endl;
                 return false;
             }
         }
@@ -314,19 +535,170 @@ void get_all_lines(const std::vector<Sviz_Plane> & all_plane, std::vector<Line_3
         }
     }
 }
+// 显示多个点云
+void show_multiple_point_clouds(const std::vector<PointCloudXYZPtr>& cloud_list) {
+    // 创建可视化窗口
+    pcl::visualization::PCLVisualizer viewer("Point Cloud Viewer");
+    viewer.setBackgroundColor(0, 0, 0);
+
+    // 添加所有点云到窗口
+    for (size_t i = 0; i < cloud_list.size(); ++i) {
+        PointCloudXYZPtr cloud = cloud_list[i];
+        std::string cloud_name = "cloud_" + std::to_string(i);
+        pcl::visualization::PointCloudColorHandlerCustom<pcl::PointXYZ> color_handler(cloud, rand() % 256, rand() % 256, rand() % 256);
+        viewer.addPointCloud<pcl::PointXYZ>(cloud, color_handler, cloud_name);
+    }
+
+    // 显示点云
+    while (!viewer.wasStopped()) {
+        viewer.spinOnce();
+    }
+}
+
+class WeldLineRec {
+private:
+    std::vector<Sviz_Plane> two_plane_;
+    std::vector<Eigen::Vector3d> ends_;
+    std::vector<std::vector<double>> welding_points_;
+    void compute_welding_angle(){
+        Eigen::Vector3d normal1, normal2;
+        normal1[0] = two_plane_[0].plane_model_[0];
+        normal1[1] = two_plane_[0].plane_model_[1];
+        normal1[2] = two_plane_[0].plane_model_[2];
+        normal2[0] = two_plane_[1].plane_model_[0];
+        normal2[1] = two_plane_[1].plane_model_[1];
+        normal2[2] = two_plane_[1].plane_model_[2];
+        // vertical or horizontal
+        if (fabs(normal1[2]) > 0.75 or fabs(normal2[2]) > 0.75) {
+            // horizontal
+            Eigen::Vector3d welding_vector;
+            welding_vector = (normal1 + normal2) / 2;
+            Eigen::Vector3d golden_vector2(0.00260663, 0.48484533, 0.51956243);
+            // rotation
+            Eigen::Matrix3d rotationMatrix;
+            rotationMatrix = Eigen::Quaterniond::FromTwoVectors(golden_vector2, welding_vector).toRotationMatrix();
+
+            // 已知的欧拉角（单位为度）
+            double eulerAngleA_deg[3] = {175.0, 40.0, 50.0};
+            double eulerAngleB_deg[3] = {175.0, 40.0, 130.0};
+
+            // 将欧拉角转换为旋转矩阵
+            Eigen::Matrix3d rotationMatrixA;
+            Eigen::Matrix3d rotationMatrixB;
+            rotationMatrixA = Eigen::AngleAxisd(eulerAngleA_deg[0] * M_PI / 180.0, Eigen::Vector3d::UnitX())
+                              * Eigen::AngleAxisd(eulerAngleA_deg[1] * M_PI / 180.0, Eigen::Vector3d::UnitY())
+                              * Eigen::AngleAxisd(eulerAngleA_deg[2] * M_PI / 180.0, Eigen::Vector3d::UnitZ());
+            rotationMatrixB = Eigen::AngleAxisd(eulerAngleB_deg[0] * M_PI / 180.0, Eigen::Vector3d::UnitX())
+                              * Eigen::AngleAxisd(eulerAngleB_deg[1] * M_PI / 180.0, Eigen::Vector3d::UnitY())
+                              * Eigen::AngleAxisd(eulerAngleB_deg[2] * M_PI / 180.0, Eigen::Vector3d::UnitZ());
+
+            // 旋转欧拉角并输出结果
+            Eigen::Vector3d eulerAngleA_rotated =
+                    (rotationMatrixA * rotationMatrix).eulerAngles(0, 1, 2) * 180.0 / M_PI;
+            Eigen::Vector3d eulerAngleB_rotated =
+                    (rotationMatrixB * rotationMatrix).eulerAngles(0, 1, 2) * 180.0 / M_PI;
+            if (fabs(normal1[2]) > fabs(normal2[2])) {
+                std::vector<double> pt1;
+                pt1 = {ends_[0][0], ends_[0][1], ends_[0][2], eulerAngleA_rotated[0], eulerAngleA_rotated[1],
+                       eulerAngleA_rotated[2]};
+                std::vector<double> pt2;
+                pt2 = {ends_[1][0], ends_[1][1], ends_[1][2], eulerAngleB_rotated[0], eulerAngleB_rotated[1],
+                       eulerAngleB_rotated[2]};
+                welding_points_ = {pt1, pt2};
+            } else {
+                std::vector<double> pt1;
+                std::vector<double> pt2;
+                pt1 = {ends_[1][0], ends_[1][1], ends_[1][2], eulerAngleA_rotated[0], eulerAngleA_rotated[1],
+                       eulerAngleA_rotated[2]};
+                pt2 = {ends_[0][0], ends_[0][1], ends_[0][2], eulerAngleB_rotated[0], eulerAngleB_rotated[1],
+                       eulerAngleB_rotated[2]};
+                welding_points_ = {pt1, pt2};
+            }
+
+        } else {
+            //vertical
+            Eigen::Vector3d welding_vector;
+            welding_vector = (normal1 + normal2) / 2;
+            Eigen::Vector3d golden_vector2(0.00260663, 0.48484533, 0.51956243);
+            // rotation
+            Eigen::Matrix3d rotationMatrix;
+            rotationMatrix = Eigen::Quaterniond::FromTwoVectors(golden_vector2, welding_vector).toRotationMatrix();
+
+            // 已知的欧拉角（单位为度）
+            double eulerAngleA_deg[3] = {175.0, 40.0, 50.0};
+            double eulerAngleB_deg[3] = {175.0, 40.0, 130.0};
+
+            // 将欧拉角转换为旋转矩阵
+            Eigen::Matrix3d rotationMatrixA;
+            Eigen::Matrix3d rotationMatrixB;
+            rotationMatrixA = Eigen::AngleAxisd(eulerAngleA_deg[0] * M_PI / 180.0, Eigen::Vector3d::UnitX())
+                              * Eigen::AngleAxisd(eulerAngleA_deg[1] * M_PI / 180.0, Eigen::Vector3d::UnitY())
+                              * Eigen::AngleAxisd(eulerAngleA_deg[2] * M_PI / 180.0, Eigen::Vector3d::UnitZ());
+            rotationMatrixB = Eigen::AngleAxisd(eulerAngleB_deg[0] * M_PI / 180.0, Eigen::Vector3d::UnitX())
+                              * Eigen::AngleAxisd(eulerAngleB_deg[1] * M_PI / 180.0, Eigen::Vector3d::UnitY())
+                              * Eigen::AngleAxisd(eulerAngleB_deg[2] * M_PI / 180.0, Eigen::Vector3d::UnitZ());
+
+            // 旋转欧拉角并输出结果
+            Eigen::Vector3d eulerAngleA_rotated =
+                    (rotationMatrixA * rotationMatrix).eulerAngles(0, 1, 2) * 180.0 / M_PI;
+            Eigen::Vector3d eulerAngleB_rotated =
+                    (rotationMatrixB * rotationMatrix).eulerAngles(0, 1, 2) * 180.0 / M_PI;
+            if (fabs(normal1[2]) > fabs(normal2[2])) {
+                std::vector<double> pt1;
+                pt1 = {ends_[0][0], ends_[0][1], ends_[0][2], eulerAngleA_rotated[0], eulerAngleA_rotated[1],
+                       eulerAngleA_rotated[2]};
+                std::vector<double> pt2;
+                pt2 = {ends_[1][0], ends_[1][1], ends_[1][2], eulerAngleB_rotated[0], eulerAngleB_rotated[1],
+                       eulerAngleB_rotated[2]};
+                welding_points_ = {pt1, pt2};
+            } else {
+                std::vector<double> pt1;
+                std::vector<double> pt2;
+                pt1 = {ends_[1][0], ends_[1][1], ends_[1][2], eulerAngleA_rotated[0], eulerAngleA_rotated[1],
+                       eulerAngleA_rotated[2]};
+                pt2 = {ends_[0][0], ends_[0][1], ends_[0][2], eulerAngleB_rotated[0], eulerAngleB_rotated[1],
+                       eulerAngleB_rotated[2]};
+                welding_points_ = {pt1, pt2};
+            }
+        }
+    }
+public:
+
+    WeldLineRec(std::vector<Sviz_Plane> two_plane, std::vector<Eigen::Vector3d> ends){
+        two_plane_ = two_plane;
+        ends_ = ends;
+        compute_welding_angle();
+    }
+    std::vector<Sviz_Plane> get_two_plane() const {
+            return two_plane_;
+    }
+    std::vector<Eigen::Vector3d> get_ends() const{
+        return ends_;
+    }
+    std::vector<std::vector<double>> get_welding_points() const{
+        return welding_points_;
+    }
 
 
+};
 // 点云到平面的距离
 // 点云到直线的距离
 // 点云到直线的投影
 // 计算焊接角度
-
+void printVector(const std::vector<std::vector<double>>& data) {
+    for (const auto& row : data) {
+        for (const auto& val : row) {
+            std::cout << val << " ";
+        }
+        std::cout << std::endl;
+    }
+}
 
 
 int main() {
     // 加载点云数据
     pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>);
-    if (pcl::io::loadPCDFile<pcl::PointXYZ>("/home/td/project/svision_c/top.pcd", *cloud) == -1) {
+    if (pcl::io::loadPCDFile<pcl::PointXYZ>("/home/td/project/svision_c/pcd/非标2-一体.pcd", *cloud) == -1) {
         PCL_ERROR("Couldn't read file\n");
         return -1;
     }
@@ -343,23 +715,35 @@ int main() {
     pcl::compute3DCentroid(*cropped_cloud, centroid);
     std::cout << "Centroid: " << centroid[0] << ", " << centroid[1] << ", " << centroid[2] << std::endl;
 
+
     // 调用获取所有平面函数
     std::vector<Sviz_Plane> all_plane;
     std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr> inlier_cloud_list = get_all_plane(cloud_downsampled, all_plane);
-
+//    for (size_t i=0; i<all_plane.size(); ++i){
+//        show_multiple_point_clouds({all_plane[i].plane_pcd_});
+//    }
     // 找到并显示相交的平面
     // weld lines
     std::vector<std::vector<Eigen::Vector3d>> welding_point_list;
+    std::vector<std::vector<std::vector<double>>> welding_point_list_angle;
     for (size_t i=0; i<all_plane.size(); ++i){
         for (size_t j= i+1; j< all_plane.size(); ++j){
             std::vector<Sviz_Plane> two_plane;
             two_plane = {all_plane[i],all_plane[j]};
-            std::vector<Eigen::Vector3d> weld_line;
-            CheckIfTwoPlaneConnect(two_plane,0.01, weld_line);
+            std::vector<Eigen::Vector3d> weld_line ={};
+//            show_multiple_point_clouds({all_plane[i].plane_pcd_,all_plane[j].plane_pcd_});
+            if(CheckIfTwoPlaneConnect(two_plane,0.01, weld_line)){
             welding_point_list.push_back(weld_line);
+            WeldLineRec wl(two_plane,weld_line);
+            std::vector<std::vector<double>> wl_with_angle;
+            wl_with_angle=wl.get_welding_points();
+            printVector(wl_with_angle);
+            welding_point_list_angle.push_back(wl_with_angle);
+            }
         }
     }
     //print welding line
+
 
     // 打印内点点云列表的大小
     std::cout << "Number of plane segments: " << inlier_cloud_list.size() << std::endl;
@@ -372,23 +756,29 @@ int main() {
 // 获取所有平面函数定义
 std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr> get_all_plane(const pcl::PointCloud<pcl::PointXYZ>::Ptr cloud, std::vector<Sviz_Plane>& all_plane) {
     std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr> inlier_cloud_list;
-
-    while (cloud->points.size() >= 2000) {
+    while (cloud->points.size() >= 1000) {
         pcl::PointIndices::Ptr inliers(new pcl::PointIndices);
         pcl::PointCloud<pcl::PointXYZ>::Ptr inlier_cloud(new pcl::PointCloud<pcl::PointXYZ>);
         std::vector<float> plane_model;
         segment_once(cloud, inliers, inlier_cloud, plane_model);
 
+        // cluster
+        std::vector<PointCloudXYZPtr> clusters ;
+        clusters = findLargestCluster(inlier_cloud);
+        inlier_cloud = clusters[0];
+        PointCloudXYZPtr remains(new pcl::PointCloud<pcl::PointXYZ>);
+        remains = clusters[1];
+
         // 将内点点云保存到列表中
-        if (inliers->indices.size ()>10000){
+        if (inlier_cloud->points.size ()>1000){
             inlier_cloud_list.push_back(inlier_cloud);
             //test
             Sviz_Plane plane_temp(inlier_cloud,plane_model);
             all_plane.push_back(plane_temp);
 //            plane_temp.visualize(true);
+        }else {
+            break;
         }
-
-
         // 更新点云为剩余点云
         pcl::PointCloud<pcl::PointXYZ>::Ptr remaining_cloud(new pcl::PointCloud<pcl::PointXYZ>);
         pcl::ExtractIndices<pcl::PointXYZ> extract;
@@ -397,6 +787,8 @@ std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr> get_all_plane(const pcl::PointC
         extract.setNegative(true); // 提取剩余点云
         extract.filter(*remaining_cloud);
         *cloud = *remaining_cloud;
+        *cloud += *remains;
+
     }
 
     return inlier_cloud_list;
@@ -421,6 +813,39 @@ void segment_once(const pcl::PointCloud<pcl::PointXYZ>::Ptr cloud,
     seg.segment(*inliers, *coefficients);
 
     plane_model=coefficients->values;
+    // filter with plane normal
+    // 计算法线
+    pcl::NormalEstimation<pcl::PointXYZ, pcl::Normal> ne;
+    ne.setInputCloud(cloud);
+    pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>);
+    ne.setSearchMethod(tree);
+    pcl::PointCloud<pcl::Normal>::Ptr cloud_normals(new pcl::PointCloud<pcl::Normal>);
+    ne.setRadiusSearch(0.01); // 设置法线估计的搜索半径
+    ne.compute(*cloud_normals);
+    // 获取平面法线
+    Eigen::Vector3f plane_normal(coefficients->values[0], coefficients->values[1], coefficients->values[2]);
+
+    // 比较每个内点的法线与平面法线的相似度，移除不相似的点
+    std::vector<int> new_inliers;
+    for (size_t i = 0; i < inliers->indices.size(); ++i) {
+        int idx = inliers->indices[i];
+        Eigen::Vector3f cloud_normal(cloud_normals->points[idx].normal_x,
+                                     cloud_normals->points[idx].normal_y,
+                                     cloud_normals->points[idx].normal_z);
+
+        // 计算余弦相似度
+        float cosine_similarity = plane_normal.dot(cloud_normal) / (plane_normal.norm() * cloud_normal.norm());
+
+        // 如果余弦相似度的绝对值大于等于0.85，则将该点添加到新的内点列表中
+        if (std::abs(cosine_similarity) >= 0.85) {
+            new_inliers.push_back(idx);
+        }
+    }
+
+    // 将新的内点列表赋值给 inliers
+    inliers->indices = new_inliers;
+
+
     // 创建一个提取器
     pcl::ExtractIndices<pcl::PointXYZ> extract;
     extract.setInputCloud(cloud);
@@ -429,25 +854,7 @@ void segment_once(const pcl::PointCloud<pcl::PointXYZ>::Ptr cloud,
     extract.filter(*inlier_cloud);
 }
 
-// 显示多个点云
-void show_multiple_point_clouds(const std::vector<PointCloudXYZPtr>& cloud_list) {
-    // 创建可视化窗口
-    pcl::visualization::PCLVisualizer viewer("Point Cloud Viewer");
-    viewer.setBackgroundColor(0, 0, 0);
 
-    // 添加所有点云到窗口
-    for (size_t i = 0; i < cloud_list.size(); ++i) {
-        PointCloudXYZPtr cloud = cloud_list[i];
-        std::string cloud_name = "cloud_" + std::to_string(i);
-        pcl::visualization::PointCloudColorHandlerCustom<pcl::PointXYZ> color_handler(cloud, rand() % 256, rand() % 256, rand() % 256);
-        viewer.addPointCloud<pcl::PointXYZ>(cloud, color_handler, cloud_name);
-    }
-
-    // 显示点云
-    while (!viewer.wasStopped()) {
-        viewer.spinOnce();
-    }
-}
 
 pcl::PointCloud<pcl::PointXYZ>::Ptr downsamplePointCloud(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud, float leaf_size) {
     // 创建 VoxelGrid 过滤器
